@@ -1,259 +1,404 @@
 #!/usr/bin/env python3
-"""POS forensics CLI using Stanza (default) or Trankit."""
+"""Simple GUI for Russian forensic POS analysis with Stanza + fallback model."""
 
 from __future__ import annotations
 
-import argparse
-import json
-from dataclasses import dataclass, asdict
-from pathlib import Path
-from typing import Any
+import re
+import statistics
+import tkinter as tk
+from collections import Counter
+from dataclasses import dataclass
+from tkinter import messagebox, ttk
+from typing import Iterable
+
+WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё-]+")
+
+UPOS_RU = {
+    "NOUN": "Существительное",
+    "PROPN": "Имя собственное",
+    "VERB": "Глагол",
+    "AUX": "Вспомогательный глагол",
+    "ADJ": "Прилагательное",
+    "ADV": "Наречие",
+    "PRON": "Местоимение",
+    "NUM": "Числительное",
+    "DET": "Определительное",
+    "ADP": "Предлог",
+    "PART": "Частица",
+    "CCONJ": "Сочинительный союз",
+    "SCONJ": "Подчинительный союз",
+    "INTJ": "Междометие",
+    "PUNCT": "Пунктуация",
+    "X": "Другое",
+}
+
+# Coarse mapping for fallback backend (pymorphy3 tags -> UD-like POS).
+PYMORPHY_POS_TO_UPOS = {
+    "NOUN": "NOUN",
+    "ADJF": "ADJ",
+    "ADJS": "ADJ",
+    "COMP": "ADV",
+    "VERB": "VERB",
+    "INFN": "VERB",
+    "PRTF": "PARTICIPLE",
+    "PRTS": "PARTICIPLE",
+    "GRND": "DEEPRICHASTIE",
+    "NUMR": "NUM",
+    "ADVB": "ADV",
+    "NPRO": "PRON",
+    "PRED": "ADV",
+    "PREP": "ADP",
+    "CONJ": "CCONJ",
+    "PRCL": "PART",
+    "INTJ": "INTJ",
+}
 
 
 @dataclass
-class TokenAnalysis:
-    sentence_id: int
-    token_id: int
+class TokenInfo:
     text: str
-    lemma: str | None
-    upos: str | None
-    xpos: str | None
-    feats: dict[str, str]
-    head_id: int | None
-    deprel: str | None
-    head_text: str | None
-    context: str
-    explanation: str
+    lemma: str
+    pos: str
+    pos_label: str
+    feats: str
 
 
-class BaseBackend:
-    def analyze(self, text: str) -> list[TokenAnalysis]:
-        raise NotImplementedError
+class Analyzer:
+    """Stanza analyzer with lightweight fallback backend."""
 
-
-class StanzaBackend(BaseBackend):
-    def __init__(self, lang: str, processors: str = "tokenize,mwt,pos,lemma,depparse") -> None:
-        import stanza
-
+    def __init__(self, lang: str = "ru") -> None:
         self.lang = lang
-        self.processors = processors
+        self.backend_name: str | None = None
+        self._backend = None
 
+    def _ensure_backend(self) -> None:
+        if self._backend is not None:
+            return
+
+        errors: list[str] = []
+
+        # Primary neural backend: Stanza with UD models.
         try:
-            self.nlp = stanza.Pipeline(
-                lang=lang,
-                processors=processors,
-                use_gpu=False,
-                verbose=False,
-            )
-        except Exception:
-            stanza.download(lang, processors=processors, verbose=False)
-            self.nlp = stanza.Pipeline(
-                lang=lang,
-                processors=processors,
-                use_gpu=False,
-                verbose=False,
-            )
+            import stanza
 
-    def analyze(self, text: str) -> list[TokenAnalysis]:
-        doc = self.nlp(text)
-        result: list[TokenAnalysis] = []
+            try:
+                self._backend = stanza.Pipeline(
+                    lang=self.lang,
+                    processors="tokenize,mwt,pos,lemma,depparse",
+                    use_gpu=False,
+                    verbose=False,
+                )
+            except Exception:
+                stanza.download(self.lang, processors="tokenize,mwt,pos,lemma,depparse", verbose=False)
+                self._backend = stanza.Pipeline(
+                    lang=self.lang,
+                    processors="tokenize,mwt,pos,lemma,depparse",
+                    use_gpu=False,
+                    verbose=False,
+                )
+            self.backend_name = "stanza"
+            return
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"stanza: {exc}")
 
-        for s_idx, sentence in enumerate(doc.sentences, start=1):
-            id_to_word = {w.id: w.text for w in sentence.words}
-            sent_text = " ".join(word.text for word in sentence.words)
+        # Reserve backend: pymorphy3 + razdel (dictionary/corpus based, no torch).
+        try:
+            import pymorphy3
+            from razdel import tokenize
 
+            self._backend = {
+                "morph": pymorphy3.MorphAnalyzer(),
+                "tokenize": tokenize,
+            }
+            self.backend_name = "pymorphy3"
+            return
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"pymorphy3: {exc}")
+
+        raise RuntimeError(
+            "Не удалось инициализировать модели анализа. "
+            "Установите stanza или fallback-зависимости pymorphy3/razdel. "
+            + " | ".join(errors)
+        )
+
+    def analyze(self, text: str) -> list[TokenInfo]:
+        self._ensure_backend()
+        if self.backend_name == "stanza":
+            return self._analyze_stanza(text)
+        return self._analyze_pymorphy(text)
+
+    def _analyze_stanza(self, text: str) -> list[TokenInfo]:
+        doc = self._backend(text)
+        items: list[TokenInfo] = []
+        for sentence in doc.sentences:
             for word in sentence.words:
-                feats = _parse_feats(word.feats)
-                head_text = id_to_word.get(word.head) if word.head and word.head != 0 else "ROOT"
-                result.append(
-                    TokenAnalysis(
-                        sentence_id=s_idx,
-                        token_id=word.id,
+                pos = _normalize_pos(word.upos, word.feats)
+                items.append(
+                    TokenInfo(
                         text=word.text,
-                        lemma=word.lemma,
-                        upos=word.upos,
-                        xpos=word.xpos,
-                        feats=feats,
-                        head_id=word.head if word.head != 0 else 0,
-                        deprel=word.deprel,
-                        head_text=head_text,
-                        context=sent_text,
-                        explanation=_build_explanation(
-                            token=word.text,
-                            upos=word.upos,
-                            deprel=word.deprel,
-                            feats=feats,
-                            head=head_text,
-                        ),
+                        lemma=word.lemma or word.text.lower(),
+                        pos=pos,
+                        pos_label=_pos_label_ru(pos),
+                        feats=word.feats or "",
                     )
                 )
+        return items
 
-        return result
+    def _analyze_pymorphy(self, text: str) -> list[TokenInfo]:
+        morph = self._backend["morph"]
+        tokenize = self._backend["tokenize"]
 
+        items: list[TokenInfo] = []
+        for t in tokenize(text):
+            token = t.text
+            if not WORD_RE.search(token):
+                items.append(TokenInfo(text=token, lemma=token, pos="PUNCT", pos_label="Пунктуация", feats=""))
+                continue
 
-class TrankitBackend(BaseBackend):
-    def __init__(self, lang: str) -> None:
-        import trankit
+            p = morph.parse(token)[0]
+            gram_pos = str(p.tag.POS) if p.tag.POS else "X"
+            upos = PYMORPHY_POS_TO_UPOS.get(gram_pos, "X")
+            upos = _normalize_pos(upos, f"VerbForm=Conv" if gram_pos == "GRND" else "")
 
-        self.pipeline = trankit.Pipeline(lang=lang)
-
-    def analyze(self, text: str) -> list[TokenAnalysis]:
-        parsed = self.pipeline.posdep(text)
-        result: list[TokenAnalysis] = []
-
-        for s_idx, sentence in enumerate(parsed.get("sentences", []), start=1):
-            tokens = sentence.get("tokens", [])
-            id_to_word = {tok.get("id"): tok.get("text") for tok in tokens}
-            sent_text = " ".join(tok.get("text", "") for tok in tokens).strip()
-
-            for tok in tokens:
-                feats = _parse_feats(tok.get("feats"))
-                head_id = tok.get("head", 0)
-                head_text = id_to_word.get(head_id) if head_id else "ROOT"
-                result.append(
-                    TokenAnalysis(
-                        sentence_id=s_idx,
-                        token_id=tok.get("id", -1),
-                        text=tok.get("text", ""),
-                        lemma=tok.get("lemma"),
-                        upos=tok.get("upos"),
-                        xpos=tok.get("xpos"),
-                        feats=feats,
-                        head_id=head_id,
-                        deprel=tok.get("deprel"),
-                        head_text=head_text,
-                        context=sent_text,
-                        explanation=_build_explanation(
-                            token=tok.get("text", ""),
-                            upos=tok.get("upos"),
-                            deprel=tok.get("deprel"),
-                            feats=feats,
-                            head=head_text,
-                        ),
-                    )
+            items.append(
+                TokenInfo(
+                    text=token,
+                    lemma=p.normal_form,
+                    pos=upos,
+                    pos_label=_pos_label_ru(upos),
+                    feats=str(p.tag),
                 )
+            )
 
-        return result
+        return items
 
 
-def _parse_feats(raw_feats: str | None) -> dict[str, str]:
-    if not raw_feats:
-        return {}
+def _feats_to_dict(feats: str) -> dict[str, str]:
     out: dict[str, str] = {}
-    for pair in raw_feats.split("|"):
+    if not feats:
+        return out
+    for pair in feats.split("|"):
         if "=" in pair:
             k, v = pair.split("=", 1)
             out[k] = v
     return out
 
 
-def _build_explanation(
-    token: str,
-    upos: str | None,
-    deprel: str | None,
-    feats: dict[str, str],
-    head: str | None,
-) -> str:
-    features = ", ".join(f"{k}={v}" for k, v in sorted(feats.items())) or "без явных морфопризнаков"
-    relation = deprel or "не указана"
-    pos = upos or "не определена"
-    head_text = head or "неизвестно"
-    return f"{token}: часть речи={pos}; связь={relation}; главный токен={head_text}; признаки={features}."
+def _normalize_pos(upos: str, feats_raw: str | None) -> str:
+    """Account for participles/deeprichastie; don't treat gerund as separate POS."""
+    upos = (upos or "X").upper()
+
+    # Explicit rule requested by user: gerund should not be separate POS.
+    if upos == "GERUND":
+        return "VERB"
+
+    feats = _feats_to_dict(feats_raw or "")
+
+    if feats.get("VerbForm") == "Part":
+        return "PARTICIPLE"
+    if feats.get("VerbForm") == "Conv":
+        return "DEEPRICHASTIE"
+
+    return upos
 
 
-def _render_pretty(rows: list[TokenAnalysis]) -> str:
-    headers = [
-        "sent",
-        "id",
-        "token",
-        "lemma",
-        "upos",
-        "xpos",
-        "deprel",
-        "head",
-        "feats",
-    ]
+def _pos_label_ru(pos: str) -> str:
+    if pos == "PARTICIPLE":
+        return "Причастие"
+    if pos == "DEEPRICHASTIE":
+        return "Деепричастие"
+    return UPOS_RU.get(pos, pos)
 
-    table: list[list[str]] = [headers]
-    for r in rows:
-        table.append(
-            [
-                str(r.sentence_id),
-                str(r.token_id),
-                r.text,
-                r.lemma or "",
-                r.upos or "",
-                r.xpos or "",
-                r.deprel or "",
-                r.head_text or "",
-                ",".join(f"{k}={v}" for k, v in r.feats.items()),
-            ]
+
+def _word_tokens(tokens: Iterable[TokenInfo]) -> list[TokenInfo]:
+    return [t for t in tokens if WORD_RE.search(t.text) and t.pos != "PUNCT"]
+
+
+def calculate_metrics(tokens: list[TokenInfo], text: str) -> dict[str, object]:
+    words = _word_tokens(tokens)
+    total = len(words)
+    if total == 0:
+        return {
+            "freq": {},
+            "additional": {
+                "Всего слов": 0,
+                "Комментарий": "Недостаточно данных для расчета показателей.",
+            },
+        }
+
+    pos_counts = Counter(t.pos_label for t in words)
+    freq = {
+        pos: {
+            "count": cnt,
+            "coefficient": round(cnt / total, 4),
+        }
+        for pos, cnt in sorted(pos_counts.items(), key=lambda x: (-x[1], x[0]))
+    }
+
+    lemmas = [t.lemma.lower() for t in words]
+    unique_words = len(set(w.text.lower() for w in words))
+    unique_lemmas = len(set(lemmas))
+    hapax = sum(1 for _, c in Counter(lemmas).items() if c == 1)
+
+    sentence_chunks = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
+    sent_lens = [len(WORD_RE.findall(s)) for s in sentence_chunks if WORD_RE.findall(s)]
+    avg_sent_len = round(sum(sent_lens) / len(sent_lens), 2) if sent_lens else 0.0
+    sent_var = round(statistics.pvariance(sent_lens), 2) if len(sent_lens) > 1 else 0.0
+
+    content_set = {"Существительное", "Имя собственное", "Глагол", "Причастие", "Деепричастие", "Прилагательное", "Наречие"}
+    function_set = {"Предлог", "Частица", "Сочинительный союз", "Подчинительный союз", "Местоимение", "Определительное"}
+    content = sum(pos_counts.get(p, 0) for p in content_set)
+    function = sum(pos_counts.get(p, 0) for p in function_set)
+
+    punct_cnt = len(re.findall(r"[,:;()\-—«»\[\]{}]", text))
+    noun_cnt = pos_counts.get("Существительное", 0) + pos_counts.get("Имя собственное", 0)
+    verb_cnt = pos_counts.get("Глагол", 0) + pos_counts.get("Вспомогательный глагол", 0)
+
+    additional = {
+        "Всего слов": total,
+        "Лексическое разнообразие (TTR)": round(unique_words / total, 4),
+        "Лемматическое разнообразие": round(unique_lemmas / total, 4),
+        "Доля hapax-лемм": round(hapax / total, 4),
+        "Средняя длина предложения (слов)": avg_sent_len,
+        "Дисперсия длины предложений": sent_var,
+        "Коэф. содержательные/служебные": round(content / function, 4) if function else "inf",
+        "Коэф. существительные/глаголы": round(noun_cnt / verb_cnt, 4) if verb_cnt else "inf",
+        "Доля причастий": round(pos_counts.get("Причастие", 0) / total, 4),
+        "Доля деепричастий": round(pos_counts.get("Деепричастие", 0) / total, 4),
+        "Пунктуация на 100 слов": round((punct_cnt / total) * 100, 2),
+    }
+
+    return {"freq": freq, "additional": additional}
+
+
+class ForensicsApp:
+    def __init__(self) -> None:
+        self.root = tk.Tk()
+        self.root.title("Forensic POS Analyzer (RU)")
+        self.root.geometry("1080x720")
+
+        self.analyzer = Analyzer(lang="ru")
+
+        self._build_ui()
+        self._bind_hotkeys()
+
+    def _build_ui(self) -> None:
+        top = ttk.Frame(self.root, padding=10)
+        top.pack(fill="both", expand=True)
+
+        ttk.Label(top, text="Введите русский текст для анализа:").pack(anchor="w")
+
+        self.text_input = tk.Text(top, height=9, wrap="word")
+        self.text_input.pack(fill="x", pady=(4, 10))
+        self._attach_context_menu(self.text_input)
+
+        btns = ttk.Frame(top)
+        btns.pack(fill="x", pady=(0, 8))
+        ttk.Button(btns, text="Анализировать (Ctrl+Enter)", command=self.run_analysis).pack(side="left")
+        ttk.Button(btns, text="Очистить", command=self.clear_all).pack(side="left", padx=8)
+
+        self.backend_var = tk.StringVar(value="backend: не инициализирован")
+        ttk.Label(btns, textvariable=self.backend_var).pack(side="right")
+
+        self.tokens_table = ttk.Treeview(
+            top,
+            columns=("token", "lemma", "pos", "feats"),
+            show="headings",
+            height=12,
         )
+        for col, width, title in [
+            ("token", 200, "Словоформа"),
+            ("lemma", 220, "Начальная форма"),
+            ("pos", 180, "Часть речи"),
+            ("feats", 420, "Морфологические признаки"),
+        ]:
+            self.tokens_table.heading(col, text=title)
+            self.tokens_table.column(col, width=width, anchor="w")
+        self.tokens_table.pack(fill="both", expand=True)
 
-    widths = [max(len(row[i]) for row in table) for i in range(len(headers))]
+        ttk.Label(top, text="Частотные коэффициенты и показатели для автороведческого анализа:").pack(anchor="w", pady=(10, 4))
 
-    def fmt(row: list[str]) -> str:
-        return " | ".join(cell.ljust(widths[i]) for i, cell in enumerate(row))
+        self.report = tk.Text(top, height=11, wrap="word")
+        self.report.pack(fill="both", expand=True)
+        self.report.configure(state="disabled")
+        self._attach_context_menu(self.report)
 
-    lines = [fmt(table[0]), "-+-".join("-" * w for w in widths)]
-    lines.extend(fmt(r) for r in table[1:])
-    return "\n".join(lines)
+    def _bind_hotkeys(self) -> None:
+        self.root.bind_all("<Control-Return>", lambda _: self.run_analysis())
+        self.text_input.bind("<Control-v>", self._paste_event)
+        self.text_input.bind("<Control-V>", self._paste_event)
 
+    def _paste_event(self, _: tk.Event) -> str:
+        try:
+            content = self.root.clipboard_get()
+            self.text_input.insert("insert", content)
+        except tk.TclError:
+            pass
+        return "break"
 
-def _read_text(args: argparse.Namespace) -> str:
-    if args.text:
-        return args.text.strip()
-    if args.input_file:
-        return Path(args.input_file).read_text(encoding="utf-8").strip()
-    raise ValueError("Передайте --text или --input-file")
+    def _attach_context_menu(self, widget: tk.Text) -> None:
+        menu = tk.Menu(widget, tearoff=0)
+        menu.add_command(label="Вырезать", command=lambda: widget.event_generate("<<Cut>>"))
+        menu.add_command(label="Копировать", command=lambda: widget.event_generate("<<Copy>>"))
+        menu.add_command(label="Вставить", command=lambda: widget.event_generate("<<Paste>>"))
+        menu.add_separator()
+        menu.add_command(label="Выделить всё", command=lambda: widget.tag_add("sel", "1.0", "end-1c"))
 
+        widget.bind("<Button-3>", lambda event: menu.tk_popup(event.x_root, event.y_root))
 
-def _create_backend(name: str, lang: str) -> BaseBackend:
-    if name == "stanza":
-        return StanzaBackend(lang=lang)
-    if name == "trankit":
-        return TrankitBackend(lang=lang)
-    raise ValueError(f"Неизвестный backend: {name}")
+    def clear_all(self) -> None:
+        self.text_input.delete("1.0", "end")
+        for row in self.tokens_table.get_children():
+            self.tokens_table.delete(row)
+        self._set_report("")
 
+    def _set_report(self, text: str) -> None:
+        self.report.configure(state="normal")
+        self.report.delete("1.0", "end")
+        self.report.insert("1.0", text)
+        self.report.configure(state="disabled")
 
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Морфологический и синтаксический forensic-анализ текста с нейросетевыми моделями."
-    )
-    parser.add_argument("--text", help="Текст для анализа")
-    parser.add_argument("--input-file", help="Путь к файлу с текстом")
-    parser.add_argument("--lang", default="ru", help="Код языка (например: ru, en, de)")
-    parser.add_argument(
-        "--backend",
-        choices=["stanza", "trankit"],
-        default="stanza",
-        help="Нейросетевой backend",
-    )
-    parser.add_argument(
-        "--format",
-        choices=["json", "pretty"],
-        default="pretty",
-        help="Формат вывода",
-    )
-    return parser
+    def run_analysis(self) -> None:
+        text = self.text_input.get("1.0", "end").strip()
+        if not text:
+            messagebox.showwarning("Нет текста", "Введите текст для анализа.")
+            return
 
+        try:
+            tokens = self.analyzer.analyze(text)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(
+                "Ошибка моделей",
+                f"Не удалось выполнить анализ: {exc}\n\n"
+                "Убедитесь, что stanza установлена; fallback использует pymorphy3/razdel.",
+            )
+            return
 
-def main() -> None:
-    parser = build_arg_parser()
-    args = parser.parse_args()
+        self.backend_var.set(f"backend: {self.analyzer.backend_name}")
 
-    text = _read_text(args)
-    backend = _create_backend(args.backend, args.lang)
-    rows = backend.analyze(text)
+        for row in self.tokens_table.get_children():
+            self.tokens_table.delete(row)
 
-    if args.format == "json":
-        print(json.dumps([asdict(r) for r in rows], ensure_ascii=False, indent=2))
-    else:
-        print(_render_pretty(rows))
-        print("\nКонтекстные объяснения:")
-        for r in rows:
-            print(f"- [{r.sentence_id}:{r.token_id}] {r.explanation}")
+        for tok in tokens:
+            if not WORD_RE.search(tok.text):
+                continue
+            self.tokens_table.insert("", "end", values=(tok.text, tok.lemma, tok.pos_label, tok.feats))
+
+        m = calculate_metrics(tokens, text)
+        lines = ["Частотные коэффициенты частей речи (count / общее количество слов):"]
+        for pos, vals in m["freq"].items():
+            lines.append(f"- {pos}: {vals['count']} / coef={vals['coefficient']}")
+
+        lines.append("\nДополнительные показатели, релевантные судебной автороведческой экспертизе (РФЦСЭ):")
+        lines.append("(могут использоваться как ориентиры в составе комплексного анализа)")
+        for k, v in m["additional"].items():
+            lines.append(f"- {k}: {v}")
+
+        self._set_report("\n".join(lines))
+
+    def run(self) -> None:
+        self.root.mainloop()
 
 
 if __name__ == "__main__":
-    main()
+    ForensicsApp().run()
