@@ -32,7 +32,6 @@ UPOS_RU = {
     "X": "Другое",
 }
 
-# Coarse mapping for fallback backend (pymorphy3 tags -> UD-like POS).
 PYMORPHY_POS_TO_UPOS = {
     "NOUN": "NOUN",
     "ADJF": "ADJ",
@@ -51,6 +50,12 @@ PYMORPHY_POS_TO_UPOS = {
     "CONJ": "CCONJ",
     "PRCL": "PART",
     "INTJ": "INTJ",
+}
+
+STYLE_MARKERS = {
+    "частицы": ["же", "ли", "вот", "ну"],
+    "связки": ["в общем", "короче", "на самом деле"],
+    "союзы": ["потому что", "так как", "однако"],
 }
 
 
@@ -77,7 +82,6 @@ class Analyzer:
 
         errors: list[str] = []
 
-        # Primary neural backend: Stanza with UD models.
         try:
             import stanza
 
@@ -101,15 +105,11 @@ class Analyzer:
         except Exception as exc:  # noqa: BLE001
             errors.append(f"stanza: {exc}")
 
-        # Reserve backend: pymorphy3 + razdel (dictionary/corpus based, no torch).
         try:
             import pymorphy3
             from razdel import tokenize
 
-            self._backend = {
-                "morph": pymorphy3.MorphAnalyzer(),
-                "tokenize": tokenize,
-            }
+            self._backend = {"morph": pymorphy3.MorphAnalyzer(), "tokenize": tokenize}
             self.backend_name = "pymorphy3"
             return
         except Exception as exc:  # noqa: BLE001
@@ -133,15 +133,7 @@ class Analyzer:
         for sentence in doc.sentences:
             for word in sentence.words:
                 pos = _normalize_pos(word.upos, word.feats)
-                items.append(
-                    TokenInfo(
-                        text=word.text,
-                        lemma=word.lemma or word.text.lower(),
-                        pos=pos,
-                        pos_label=_pos_label_ru(pos),
-                        feats=word.feats or "",
-                    )
-                )
+                items.append(TokenInfo(word.text, word.lemma or word.text.lower(), pos, _pos_label_ru(pos), word.feats or ""))
         return items
 
     def _analyze_pymorphy(self, text: str) -> list[TokenInfo]:
@@ -152,23 +144,14 @@ class Analyzer:
         for t in tokenize(text):
             token = t.text
             if not WORD_RE.search(token):
-                items.append(TokenInfo(text=token, lemma=token, pos="PUNCT", pos_label="Пунктуация", feats=""))
+                items.append(TokenInfo(token, token, "PUNCT", "Пунктуация", ""))
                 continue
 
             p = morph.parse(token)[0]
             gram_pos = str(p.tag.POS) if p.tag.POS else "X"
             upos = PYMORPHY_POS_TO_UPOS.get(gram_pos, "X")
             upos = _normalize_pos(upos, f"VerbForm=Conv" if gram_pos == "GRND" else "")
-
-            items.append(
-                TokenInfo(
-                    text=token,
-                    lemma=p.normal_form,
-                    pos=upos,
-                    pos_label=_pos_label_ru(upos),
-                    feats=str(p.tag),
-                )
-            )
+            items.append(TokenInfo(token, p.normal_form, upos, _pos_label_ru(upos), str(p.tag)))
 
         return items
 
@@ -185,20 +168,15 @@ def _feats_to_dict(feats: str) -> dict[str, str]:
 
 
 def _normalize_pos(upos: str, feats_raw: str | None) -> str:
-    """Account for participles/deeprichastie; don't treat gerund as separate POS."""
     upos = (upos or "X").upper()
-
-    # Explicit rule requested by user: gerund should not be separate POS.
     if upos == "GERUND":
         return "VERB"
 
     feats = _feats_to_dict(feats_raw or "")
-
     if feats.get("VerbForm") == "Part":
         return "PARTICIPLE"
     if feats.get("VerbForm") == "Conv":
         return "DEEPRICHASTIE"
-
     return upos
 
 
@@ -214,26 +192,79 @@ def _word_tokens(tokens: Iterable[TokenInfo]) -> list[TokenInfo]:
     return [t for t in tokens if WORD_RE.search(t.text) and t.pos != "PUNCT"]
 
 
+def _count_style_markers(text: str) -> dict[str, dict[str, int]]:
+    lowered = f" {text.lower()} "
+    out: dict[str, dict[str, int]] = {}
+    for group, markers in STYLE_MARKERS.items():
+        out[group] = {}
+        for marker in markers:
+            pattern = rf"(?<!\w){re.escape(marker)}(?!\w)"
+            out[group][marker] = len(re.findall(pattern, lowered))
+    return out
+
+
+def _char_ngrams(text: str, n_values: tuple[int, ...] = (3, 4, 5), top_k: int = 10) -> dict[str, list[tuple[str, int]]]:
+    prepared = re.sub(r"\s+", " ", text.lower())
+    out: dict[str, list[tuple[str, int]]] = {}
+    for n in n_values:
+        grams = [prepared[i : i + n] for i in range(max(len(prepared) - n + 1, 0))]
+        out[f"char_{n}gram"] = Counter(grams).most_common(top_k)
+    return out
+
+
+def _pos_ngrams(tokens: list[TokenInfo], top_k: int = 10) -> dict[str, list[tuple[str, int]]]:
+    pos_seq = [t.pos_label for t in _word_tokens(tokens)]
+    result: dict[str, list[tuple[str, int]]] = {}
+    for n in (2, 3):
+        grams = [" ".join(pos_seq[i : i + n]) for i in range(max(len(pos_seq) - n + 1, 0))]
+        result[f"pos_{n}gram"] = Counter(grams).most_common(top_k)
+    return result
+
+
+def _punctuation_patterns(text: str) -> dict[str, float | int]:
+    words = max(len(WORD_RE.findall(text)), 1)
+    dash = text.count("—")
+    hyphen = text.count("-") - dash
+    ellipsis_unicode = text.count("…")
+    ellipsis_three = text.count("...")
+    return {
+        "тире_эмдеш": dash,
+        "дефис": max(hyphen, 0),
+        "доля_тире_среди_тире_и_дефисов": round(dash / (dash + max(hyphen, 0)), 4) if (dash + max(hyphen, 0)) else 0.0,
+        "троеточие_символ": ellipsis_unicode,
+        "троеточие_три_точки": ellipsis_three,
+        "комбо_!?": len(re.findall(r"!\?", text)),
+        "комбо_??": len(re.findall(r"\?\?", text)),
+        "комбо_!!": len(re.findall(r"!!", text)),
+        "пробел_перед_запятой": len(re.findall(r"\s,", text)),
+        "пробел_перед_точкой": len(re.findall(r"\s\.", text)),
+        "знаков_препинания_на_100_слов": round((len(re.findall(r"[.,!?;:—\-…]", text)) / words) * 100, 2),
+    }
+
+
+def _orthography_flags(text: str) -> dict[str, float | int]:
+    words = WORD_RE.findall(text)
+    words_cnt = max(len(words), 1)
+    lower = text.lower()
+    yo = len(re.findall("ё", lower))
+    e = len(re.findall("е", lower))
+    return {
+        "доля_ё_среди_е_ё": round(yo / (yo + e), 4) if (yo + e) else 0.0,
+        "ALL_CAPS_слов": len([w for w in words if len(w) > 1 and w.isupper()]),
+        "повтор_знаков_3plus": len(re.findall(r"([!?.,])\1{2,}", text)),
+        "подозрительные_тся_ться": len(re.findall(r"\b\w+т(ь)?ся\b", lower)),
+        "доля_caps_слов": round(len([w for w in words if len(w) > 1 and w.isupper()]) / words_cnt, 4),
+    }
+
+
 def calculate_metrics(tokens: list[TokenInfo], text: str) -> dict[str, object]:
     words = _word_tokens(tokens)
     total = len(words)
     if total == 0:
-        return {
-            "freq": {},
-            "additional": {
-                "Всего слов": 0,
-                "Комментарий": "Недостаточно данных для расчета показателей.",
-            },
-        }
+        return {"freq": {}, "additional": {"Всего слов": 0, "Комментарий": "Недостаточно данных для расчета показателей."}}
 
     pos_counts = Counter(t.pos_label for t in words)
-    freq = {
-        pos: {
-            "count": cnt,
-            "coefficient": round(cnt / total, 4),
-        }
-        for pos, cnt in sorted(pos_counts.items(), key=lambda x: (-x[1], x[0]))
-    }
+    freq = {pos: {"count": cnt, "coefficient": round(cnt / total, 4)} for pos, cnt in sorted(pos_counts.items(), key=lambda x: (-x[1], x[0]))}
 
     lemmas = [t.lemma.lower() for t in words]
     unique_words = len(set(w.text.lower() for w in words))
@@ -250,7 +281,6 @@ def calculate_metrics(tokens: list[TokenInfo], text: str) -> dict[str, object]:
     content = sum(pos_counts.get(p, 0) for p in content_set)
     function = sum(pos_counts.get(p, 0) for p in function_set)
 
-    punct_cnt = len(re.findall(r"[,:;()\-—«»\[\]{}]", text))
     noun_cnt = pos_counts.get("Существительное", 0) + pos_counts.get("Имя собственное", 0)
     verb_cnt = pos_counts.get("Глагол", 0) + pos_counts.get("Вспомогательный глагол", 0)
 
@@ -265,10 +295,17 @@ def calculate_metrics(tokens: list[TokenInfo], text: str) -> dict[str, object]:
         "Коэф. существительные/глаголы": round(noun_cnt / verb_cnt, 4) if verb_cnt else "inf",
         "Доля причастий": round(pos_counts.get("Причастие", 0) / total, 4),
         "Доля деепричастий": round(pos_counts.get("Деепричастие", 0) / total, 4),
-        "Пунктуация на 100 слов": round((punct_cnt / total) * 100, 2),
     }
 
-    return {"freq": freq, "additional": additional}
+    return {
+        "freq": freq,
+        "additional": additional,
+        "service_profile": _count_style_markers(text),
+        "char_ngrams": _char_ngrams(text),
+        "pos_ngrams": _pos_ngrams(tokens),
+        "punctuation_patterns": _punctuation_patterns(text),
+        "orthography_flags": _orthography_flags(text),
+    }
 
 
 class ForensicsApp:
@@ -278,7 +315,6 @@ class ForensicsApp:
         self.root.geometry("1080x720")
 
         self.analyzer = Analyzer(lang="ru")
-
         self._build_ui()
         self._bind_hotkeys()
 
@@ -287,7 +323,6 @@ class ForensicsApp:
         top.pack(fill="both", expand=True)
 
         ttk.Label(top, text="Введите русский текст для анализа:").pack(anchor="w")
-
         self.text_input = tk.Text(top, height=9, wrap="word")
         self.text_input.pack(fill="x", pady=(4, 10))
         self._attach_context_menu(self.text_input)
@@ -300,24 +335,13 @@ class ForensicsApp:
         self.backend_var = tk.StringVar(value="backend: не инициализирован")
         ttk.Label(btns, textvariable=self.backend_var).pack(side="right")
 
-        self.tokens_table = ttk.Treeview(
-            top,
-            columns=("token", "lemma", "pos", "feats"),
-            show="headings",
-            height=12,
-        )
-        for col, width, title in [
-            ("token", 200, "Словоформа"),
-            ("lemma", 220, "Начальная форма"),
-            ("pos", 180, "Часть речи"),
-            ("feats", 420, "Морфологические признаки"),
-        ]:
+        self.tokens_table = ttk.Treeview(top, columns=("token", "lemma", "pos", "feats"), show="headings", height=12)
+        for col, width, title in [("token", 200, "Словоформа"), ("lemma", 220, "Начальная форма"), ("pos", 180, "Часть речи"), ("feats", 420, "Морфологические признаки")]:
             self.tokens_table.heading(col, text=title)
             self.tokens_table.column(col, width=width, anchor="w")
         self.tokens_table.pack(fill="both", expand=True)
 
         ttk.Label(top, text="Частотные коэффициенты и показатели для автороведческого анализа:").pack(anchor="w", pady=(10, 4))
-
         self.report = tk.Text(top, height=11, wrap="word")
         self.report.pack(fill="both", expand=True)
         self.report.configure(state="disabled")
@@ -330,8 +354,7 @@ class ForensicsApp:
 
     def _paste_event(self, _: tk.Event) -> str:
         try:
-            content = self.root.clipboard_get()
-            self.text_input.insert("insert", content)
+            self.text_input.insert("insert", self.root.clipboard_get())
         except tk.TclError:
             pass
         return "break"
@@ -343,7 +366,6 @@ class ForensicsApp:
         menu.add_command(label="Вставить", command=lambda: widget.event_generate("<<Paste>>"))
         menu.add_separator()
         menu.add_command(label="Выделить всё", command=lambda: widget.tag_add("sel", "1.0", "end-1c"))
-
         widget.bind("<Button-3>", lambda event: menu.tk_popup(event.x_root, event.y_root))
 
     def clear_all(self) -> None:
@@ -367,31 +389,45 @@ class ForensicsApp:
         try:
             tokens = self.analyzer.analyze(text)
         except Exception as exc:  # noqa: BLE001
-            messagebox.showerror(
-                "Ошибка моделей",
-                f"Не удалось выполнить анализ: {exc}\n\n"
-                "Убедитесь, что stanza установлена; fallback использует pymorphy3/razdel.",
-            )
+            messagebox.showerror("Ошибка моделей", f"Не удалось выполнить анализ: {exc}\n\nУбедитесь, что stanza установлена; fallback использует pymorphy3/razdel.")
             return
 
         self.backend_var.set(f"backend: {self.analyzer.backend_name}")
-
         for row in self.tokens_table.get_children():
             self.tokens_table.delete(row)
 
         for tok in tokens:
-            if not WORD_RE.search(tok.text):
-                continue
-            self.tokens_table.insert("", "end", values=(tok.text, tok.lemma, tok.pos_label, tok.feats))
+            if WORD_RE.search(tok.text):
+                self.tokens_table.insert("", "end", values=(tok.text, tok.lemma, tok.pos_label, tok.feats))
 
         m = calculate_metrics(tokens, text)
         lines = ["Частотные коэффициенты частей речи (count / общее количество слов):"]
         for pos, vals in m["freq"].items():
             lines.append(f"- {pos}: {vals['count']} / coef={vals['coefficient']}")
 
-        lines.append("\nДополнительные показатели, релевантные судебной автороведческой экспертизе (РФЦСЭ):")
-        lines.append("(могут использоваться как ориентиры в составе комплексного анализа)")
+        lines.append("\nДополнительные показатели (ориентиры для автороведческой экспертизы):")
         for k, v in m["additional"].items():
+            lines.append(f"- {k}: {v}")
+
+        lines.append("\nПрофиль служебных слов/дискурсивных маркеров:")
+        for group, vals in m["service_profile"].items():
+            joined = ", ".join(f"{k}={v}" for k, v in vals.items())
+            lines.append(f"- {group}: {joined}")
+
+        lines.append("\nPOS n-граммы (top):")
+        for n_name, grams in m["pos_ngrams"].items():
+            lines.append(f"- {n_name}: " + "; ".join(f"'{g}'={c}" for g, c in grams[:7]))
+
+        lines.append("\nСимвольные n-граммы 3-5 (top):")
+        for n_name, grams in m["char_ngrams"].items():
+            lines.append(f"- {n_name}: " + "; ".join(f"'{g}'={c}" for g, c in grams[:7]))
+
+        lines.append("\nПунктуационные паттерны:")
+        for k, v in m["punctuation_patterns"].items():
+            lines.append(f"- {k}: {v}")
+
+        lines.append("\nОрфографические признаки:")
+        for k, v in m["orthography_flags"].items():
             lines.append(f"- {k}: {v}")
 
         self._set_report("\n".join(lines))
