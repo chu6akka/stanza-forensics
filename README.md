@@ -14,6 +14,14 @@ Stanza из приложения удалена.
 
 Частый случай: ошибка `No module named 'pkg_resources'` — это обычно означает отсутствие `setuptools`.
 
+Дополнительно приложение теперь делает авто-попытку исправления этой проблемы: если при загрузке Natasha обнаружен `pkg_resources`, выполняется команда через тот же интерпретатор:
+
+```powershell
+python -m pip install --upgrade setuptools wheel
+```
+
+Если автоисправление не удалось, во всплывающем окне будет текст причины и команда, которую нужно запустить вручную.
+
 ## Что улучшено
 
 - все основные показатели и лингвистические характеристики в интерфейсе выведены на русском языке;
@@ -37,3 +45,19 @@ pip install -r requirements.txt
 ```bash
 python pos_forensics.py
 ```
+
+
+## Что делать при ошибке `No module named 'pkg_resources'`
+
+Эта ошибка почти всегда означает, что приложение запускается одним интерпретатором Python, а пакеты установлены в другом.
+
+Проверьте и используйте один и тот же Python:
+
+```powershell
+python -c "import sys; print(sys.executable)"
+python -m pip install --upgrade pip setuptools wheel
+python -c "import pkg_resources; print(pkg_resources.__file__)"
+python pos_forensics.py
+```
+
+Если ошибка не исчезает, рекомендуется создать новое окружение на Python 3.11 и установить зависимости заново.

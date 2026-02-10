@@ -6,6 +6,8 @@ from __future__ import annotations
 import colorsys
 import re
 import statistics
+import subprocess
+import sys
 import tkinter as tk
 from collections import Counter
 from dataclasses import dataclass
@@ -184,8 +186,29 @@ class Analyzer:
         self._backend = None
         self.last_errors: dict[str, str] = {}
 
+    def _autofix_pkg_resources(self) -> tuple[bool, str]:
+        cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "setuptools", "wheel"]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+            if proc.returncode == 0:
+                return True, f"Автоисправление выполнено командой: {' '.join(cmd)}"
+            return False, f"Автоисправление не удалось (код {proc.returncode}). Команда: {' '.join(cmd)}\n{out.strip()}"
+        except Exception as exc:  # noqa: BLE001
+            return False, f"Автоисправление не выполнено: {exc}"
+
     def _init_natasha(self):
-        from natasha import Doc, MorphVocab, NewsEmbedding, NewsMorphTagger, Segmenter
+        try:
+            from natasha import Doc, MorphVocab, NewsEmbedding, NewsMorphTagger, Segmenter
+        except ModuleNotFoundError as exc:
+            if "pkg_resources" in str(exc):
+                ok, msg = self._autofix_pkg_resources()
+                if ok:
+                    from natasha import Doc, MorphVocab, NewsEmbedding, NewsMorphTagger, Segmenter
+                else:
+                    raise ModuleNotFoundError(f"{exc}. {msg}") from exc
+            else:
+                raise
 
         return {
             "Doc": Doc,
@@ -306,15 +329,19 @@ def _pos_label_ru(pos: str) -> str:
 def _diagnose_backend_error(reason: str) -> str:
     r = (reason or "").lower()
     tips: list[str] = []
+    py = sys.executable
     if "no module named 'pkg_resources'" in r:
-        tips.append("Не найден модуль pkg_resources (обычно отсутствует setuptools).")
-        tips.append("Решение: pip install setuptools")
+        tips.append("Не найден модуль pkg_resources (часто это конфликт Python/venv или неполная установка setuptools).")
+        tips.append(f"Проверьте интерпретатор приложения: {py}")
+        tips.append(f"Запустите этим же интерпретатором: \"{py}\" -m pip install --upgrade pip setuptools wheel")
+        tips.append(f"Проверка: \"{py}\" -c \"import pkg_resources; print(pkg_resources.__file__)\"")
+        tips.append("Если не помогло: создайте новое venv на Python 3.11 и переустановите зависимости.")
     if "no module named" in r and "natasha" in r:
         tips.append("Не установлен пакет Natasha.")
-        tips.append("Решение: pip install natasha")
+        tips.append(f"Решение: \"{py}\" -m pip install natasha")
     if "no module named" in r and "pymorphy3" in r:
         tips.append("Не установлен пакет pymorphy3.")
-        tips.append("Решение: pip install pymorphy3 razdel")
+        tips.append(f"Решение: \"{py}\" -m pip install pymorphy3 razdel")
     if "cannot import" in r or "dll" in r:
         tips.append("Возможна проблема бинарных зависимостей/окружения Python.")
         tips.append("Решение: создать новое venv и переустановить зависимости.")
