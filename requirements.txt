@@ -1,0 +1,11 @@
+natasha>=1.6.0
+pymorphy3>=2.0.2
+razdel>=0.5.0
+python-docx>=1.1.2
+numpy>=1.26.4
+scipy>=1.11.4
+scikit-learn>=1.4.2
+rapidfuzz>=3.9.6
+regex>=2024.7.24
+setuptools>=68.0.0
+pytest>=8.2.0
