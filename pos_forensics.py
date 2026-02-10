@@ -155,6 +155,18 @@ STYLE_MARKERS = {
     "союзы": ["потому что", "так как", "однако"],
 }
 
+INTENTIONAL_TYPO_MARKERS = [
+    "щас",
+    "счас",
+    "ваще",
+    "кароч",
+    "чо",
+    "тока",
+    "шо",
+    "канеш",
+    "превед",
+]
+
 
 @dataclass
 class TokenInfo:
@@ -170,6 +182,7 @@ class Analyzer:
         self.lang = lang
         self.backend_name: str | None = None
         self._backend = None
+        self.last_errors: dict[str, str] = {}
 
     def _init_natasha(self):
         from natasha import Doc, MorphVocab, NewsEmbedding, NewsMorphTagger, Segmenter
@@ -187,16 +200,17 @@ class Analyzer:
 
         return {"morph": pymorphy3.MorphAnalyzer(), "tokenize": tokenize}
 
-    def _ensure_backend(self, preferred: str = "natasha") -> None:
+    def _ensure_backend(self, preferred: str = "natasha") -> tuple[str | None, str | None]:
+        """Return (preferred_backend_name, fail_reason_if_preferred_failed)."""
         if self._backend is not None and self.backend_name == preferred:
-            return
+            return preferred, None
 
         orders = {
             "natasha": ["natasha", "pymorphy3"],
             "pymorphy3": ["pymorphy3", "natasha"],
         }
         order = orders.get(preferred, orders["natasha"])
-        errors: list[str] = []
+        self.last_errors = {}
 
         for name in order:
             try:
@@ -205,17 +219,18 @@ class Analyzer:
                 else:
                     self._backend = self._init_pymorphy()
                 self.backend_name = name
-                return
+                fail_reason = self.last_errors.get(preferred)
+                return preferred, fail_reason
             except Exception as exc:  # noqa: BLE001
-                errors.append(f"{name}: {exc}")
+                self.last_errors[name] = str(exc)
 
-        raise RuntimeError("Не удалось инициализировать бэкенды Natasha и pymorphy3. " + " | ".join(errors))
+        raise RuntimeError("Не удалось инициализировать бэкенды Natasha и pymorphy3. " + " | ".join(f"{k}: {v}" for k, v in self.last_errors.items()))
 
-    def analyze(self, text: str, preferred_backend: str = "natasha") -> list[TokenInfo]:
-        self._ensure_backend(preferred_backend)
+    def analyze(self, text: str, preferred_backend: str = "natasha") -> tuple[list[TokenInfo], str | None]:
+        _, fail_reason = self._ensure_backend(preferred_backend)
         if self.backend_name == "natasha":
-            return self._analyze_natasha(text)
-        return self._analyze_pymorphy(text)
+            return self._analyze_natasha(text), fail_reason
+        return self._analyze_pymorphy(text), fail_reason
 
     def _analyze_natasha(self, text: str) -> list[TokenInfo]:
         Doc = self._backend["Doc"]
@@ -295,11 +310,45 @@ def _count_style_markers(text: str) -> dict[str, dict[str, int]]:
     return {g: {m: len(re.findall(rf"(?<!\w){re.escape(m)}(?!\w)", lowered)) for m in marks} for g, marks in STYLE_MARKERS.items()}
 
 
+def _register_profile(text: str) -> dict[str, float | int]:
+    words = [w for w in re.findall(r"[A-Za-zА-Яа-яЁё]+", text) if w]
+    total = max(len(words), 1)
+    upper = sum(1 for w in words if len(w) > 1 and w.isupper())
+    lower = sum(1 for w in words if w.islower())
+    mixed = total - upper - lower
+    return {
+        "Слов всего": len(words),
+        "Доля ВЕРХНЕГО РЕГИСТРА": round(upper / total, 4),
+        "Доля нижнего регистра": round(lower / total, 4),
+        "Доля смешанного регистра": round(mixed / total, 4),
+    }
+
+
+def _duplications_and_typos(text: str) -> dict[str, float | int | str]:
+    lowered = text.lower()
+    repeated_letters = len(re.findall(r"([а-яёa-z])\1{2,}", lowered))
+    repeated_punct = len(re.findall(r"([!?.,])\1{1,}", text))
+    typo_hits = {m: len(re.findall(rf"(?<!\w){re.escape(m)}(?!\w)", lowered)) for m in INTENTIONAL_TYPO_MARKERS}
+    typo_total = sum(typo_hits.values())
+    return {
+        "Повторы букв (>=3 подряд)": repeated_letters,
+        "Повторы знаков препинания (>=2 подряд)": repeated_punct,
+        "Намеренные разговорные/искажённые формы (всего)": typo_total,
+        "Найденные формы": ", ".join(f"{k}:{v}" for k, v in typo_hits.items() if v > 0) or "не обнаружены",
+    }
+
+
 def calculate_metrics(tokens: list[TokenInfo], text: str) -> dict[str, object]:
     words = _word_tokens(tokens)
     total = len(words)
     if total == 0:
-        return {"частоты": {}, "дополнительно": {"Всего слов": 0, "Комментарий": "Недостаточно данных для расчета показателей."}, "профиль_служебных_слов": {}}
+        return {
+            "частоты": {},
+            "дополнительно": {"Всего слов": 0, "Комментарий": "Недостаточно данных для расчета показателей."},
+            "профиль_служебных_слов": {},
+            "регистровый_профиль": _register_profile(text),
+            "повторы_и_опечатки": _duplications_and_typos(text),
+        }
 
     pos_counts = Counter(t.pos_label for t in words)
     freq = {p: {"количество": c, "коэффициент": round(c / total, 4)} for p, c in sorted(pos_counts.items(), key=lambda x: (-x[1], x[0]))}
@@ -329,6 +378,8 @@ def calculate_metrics(tokens: list[TokenInfo], text: str) -> dict[str, object]:
         "частоты": freq,
         "дополнительно": additional,
         "профиль_служебных_слов": _count_style_markers(text),
+        "регистровый_профиль": _register_profile(text),
+        "повторы_и_опечатки": _duplications_and_typos(text),
     }
 
 
@@ -458,14 +509,23 @@ class ForensicsApp:
         if not text:
             messagebox.showwarning("Нет текста", "Введите текст для анализа.")
             return
+        preferred = self.backend_choice.get()
         try:
-            tokens = self.analyzer.analyze(text, preferred_backend=self.backend_choice.get())
+            tokens, preferred_fail_reason = self.analyzer.analyze(text, preferred_backend=preferred)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Ошибка моделей", f"Не удалось выполнить анализ: {exc}")
             return
 
         self.backend_var.set(f"бэкенд: {self.analyzer.backend_name}")
         self._set_backend_hint(self.analyzer.backend_name or "natasha")
+
+        if preferred_fail_reason and self.analyzer.backend_name != preferred:
+            messagebox.showwarning(
+                "Бэкенд не загрузился",
+                f"Выбранный бэкенд «{preferred}» не инициализировался.\n"
+                f"Причина: {preferred_fail_reason}\n\n"
+                f"Автоматически использован «{self.analyzer.backend_name}" + "»."
+            )
 
         for r in self.tokens_table.get_children():
             self.tokens_table.delete(r)
@@ -481,6 +541,10 @@ class ForensicsApp:
         lines.append("\nПрофиль служебных слов:")
         for g, vals in m["профиль_служебных_слов"].items():
             lines.append(f"- {g}: " + ", ".join(f"{k}={v}" for k, v in vals.items()))
+        lines.append("\nПрофиль регистра:")
+        lines += [f"- {k}: {v}" for k, v in m["регистровый_профиль"].items()]
+        lines.append("\nПовторы, намеренные опечатки и искажения:")
+        lines += [f"- {k}: {v}" for k, v in m["повторы_и_опечатки"].items()]
 
         self._set_report("\n".join(lines))
 
