@@ -43,6 +43,22 @@ class MainWindow(tk.Tk):
         }
 
         self._build_ui()
+        self._bind_global_hotkeys()
+
+    def _bind_global_hotkeys(self) -> None:
+        self.bind_all("<Control-v>", self._paste_focused_widget)
+        self.bind_all("<Control-V>", self._paste_focused_widget)
+        self.bind_all("<Shift-Insert>", self._paste_focused_widget)
+
+    def _paste_focused_widget(self, _: tk.Event) -> str:
+        widget = self.focus_get()
+        if widget is None:
+            return "break"
+        try:
+            widget.event_generate("<<Paste>>")
+        except Exception:
+            pass
+        return "break"
 
     def _build_ui(self) -> None:
         header = ttk.Frame(self)
@@ -69,7 +85,7 @@ class MainWindow(tk.Tk):
     def _show_diagnostics(self) -> None:
         info = {
             "python": platform.python_version(),
-            "executable": platform.python_implementation(),
+            "implementation": platform.python_implementation(),
             "platform": platform.platform(),
             "backend_selected": self.backend_var.get(),
         }
@@ -125,9 +141,9 @@ class MainWindow(tk.Tk):
                 export_json(payload, out_json)
                 doc_id = self.store.add_document(self.case_id, "исследуемый", f"Документ {mode}", "", manifest["sha256"])
                 self.store.add_run(doc_id, mode, {}, backend_name, {"python": platform.python_version()}, warnings, str(out_json))
-                callback(payload, None)
+                self.after(0, lambda: callback(payload, None))
             except Exception as exc:  # noqa: BLE001
-                callback(None, str(exc))
+                self.after(0, lambda: callback(None, str(exc)))
 
         threading.Thread(target=worker, daemon=True).start()
 

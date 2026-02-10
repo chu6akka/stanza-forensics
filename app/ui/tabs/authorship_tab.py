@@ -18,6 +18,15 @@ class AuthorshipTab(ttk.Frame):
 
         self.out = tk.Text(self, height=30, wrap="word")
         self.out.pack(fill="both", expand=True, padx=8, pady=4)
+        self._attach_context_menu(self.out)
+
+    def _attach_context_menu(self, widget: tk.Text) -> None:
+        menu = tk.Menu(widget, tearoff=0)
+        menu.add_command(label="Копировать", command=lambda: widget.event_generate("<<Copy>>"))
+        menu.add_command(label="Вставить", command=lambda: widget.event_generate("<<Paste>>"))
+        menu.add_separator()
+        menu.add_command(label="Выделить всё", command=lambda: widget.tag_add("sel", "1.0", "end-1c"))
+        widget.bind("<Button-3>", lambda event: menu.tk_popup(event.x_root, event.y_root))
 
     def load_main(self) -> None:
         p = filedialog.askopenfilename(filetypes=[("Text", "*.txt")])

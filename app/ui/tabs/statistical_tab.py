@@ -13,6 +13,7 @@ class StatisticalTab(ttk.Frame):
 
         self.text = tk.Text(self, height=18, wrap="word")
         self.text.pack(fill="both", expand=False, padx=8, pady=4)
+        self._attach_context_menu(self.text)
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=8, pady=4)
@@ -21,6 +22,16 @@ class StatisticalTab(ttk.Frame):
 
         self.report = tk.Text(self, height=20, wrap="word")
         self.report.pack(fill="both", expand=True, padx=8, pady=4)
+        self._attach_context_menu(self.report)
+
+    def _attach_context_menu(self, widget: tk.Text) -> None:
+        menu = tk.Menu(widget, tearoff=0)
+        menu.add_command(label="Вырезать", command=lambda: widget.event_generate("<<Cut>>"))
+        menu.add_command(label="Копировать", command=lambda: widget.event_generate("<<Copy>>"))
+        menu.add_command(label="Вставить", command=lambda: widget.event_generate("<<Paste>>"))
+        menu.add_separator()
+        menu.add_command(label="Выделить всё", command=lambda: widget.tag_add("sel", "1.0", "end-1c"))
+        widget.bind("<Button-3>", lambda event: menu.tk_popup(event.x_root, event.y_root))
 
     def set_text(self, text: str) -> None:
         self.text.delete("1.0", "end")
