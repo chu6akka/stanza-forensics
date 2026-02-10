@@ -301,6 +301,27 @@ def _pos_label_ru(pos: str) -> str:
     return "Причастие" if pos == "PARTICIPLE" else "Деепричастие" if pos == "DEEPRICHASTIE" else UPOS_RU.get(pos, pos)
 
 
+
+
+def _diagnose_backend_error(reason: str) -> str:
+    r = (reason or "").lower()
+    tips: list[str] = []
+    if "no module named 'pkg_resources'" in r:
+        tips.append("Не найден модуль pkg_resources (обычно отсутствует setuptools).")
+        tips.append("Решение: pip install setuptools")
+    if "no module named" in r and "natasha" in r:
+        tips.append("Не установлен пакет Natasha.")
+        tips.append("Решение: pip install natasha")
+    if "no module named" in r and "pymorphy3" in r:
+        tips.append("Не установлен пакет pymorphy3.")
+        tips.append("Решение: pip install pymorphy3 razdel")
+    if "cannot import" in r or "dll" in r:
+        tips.append("Возможна проблема бинарных зависимостей/окружения Python.")
+        tips.append("Решение: создать новое venv и переустановить зависимости.")
+    if not tips:
+        tips.append("Проверьте зависимости и окружение Python (venv).")
+    return "\n".join(f"• {t}" for t in tips)
+
 def _word_tokens(tokens: Iterable[TokenInfo]) -> list[TokenInfo]:
     return [t for t in tokens if WORD_RE.search(t.text) and t.pos != "PUNCT"]
 
@@ -520,11 +541,13 @@ class ForensicsApp:
         self._set_backend_hint(self.analyzer.backend_name or "natasha")
 
         if preferred_fail_reason and self.analyzer.backend_name != preferred:
+            diagnostics = _diagnose_backend_error(preferred_fail_reason)
             messagebox.showwarning(
                 "Бэкенд не загрузился",
                 f"Выбранный бэкенд «{preferred}» не инициализировался.\n"
                 f"Причина: {preferred_fail_reason}\n\n"
-                f"Автоматически использован «{self.analyzer.backend_name}" + "»."
+                f"Автоматически использован «{self.analyzer.backend_name}».\n\n"
+                f"Диагностика:\n{diagnostics}"
             )
 
         for r in self.tokens_table.get_children():
