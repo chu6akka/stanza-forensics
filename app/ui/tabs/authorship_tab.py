@@ -1,5 +1,9 @@
+import json
 import tkinter as tk
+from pathlib import Path
 from tkinter import filedialog, ttk
+
+from docx import Document
 
 
 class AuthorshipTab(ttk.Frame):
@@ -8,7 +12,7 @@ class AuthorshipTab(ttk.Frame):
         self.app = app
         self.main_text = ""
         self.sample_text = ""
-        self.last_score = 0.0
+        self.last_result: dict = {}
 
         bar = ttk.Frame(self)
         bar.pack(fill="x", padx=8, pady=4)
@@ -28,23 +32,76 @@ class AuthorshipTab(ttk.Frame):
         menu.add_command(label="Выделить всё", command=lambda: widget.tag_add("sel", "1.0", "end-1c"))
         widget.bind("<Button-3>", lambda event: menu.tk_popup(event.x_root, event.y_root))
 
+    def _load_text_file(self) -> str:
+        p = filedialog.askopenfilename(filetypes=[("Text", "*.txt *.docx")])
+        if not p:
+            return ""
+        path = Path(p)
+        if path.suffix.lower() == ".docx":
+            doc = Document(path)
+            return "\n".join(par.text for par in doc.paragraphs)
+        return path.read_text(encoding="utf-8", errors="ignore")
+
     def load_main(self) -> None:
-        p = filedialog.askopenfilename(filetypes=[("Text", "*.txt")])
-        if p:
-            self.main_text = open(p, encoding="utf-8", errors="ignore").read()
+        text = self._load_text_file()
+        if text:
+            self.main_text = text
 
     def load_sample(self) -> None:
-        p = filedialog.askopenfilename(filetypes=[("Text", "*.txt")])
-        if p:
-            self.sample_text = open(p, encoding="utf-8", errors="ignore").read()
+        text = self._load_text_file()
+        if text:
+            self.sample_text = text
 
     def compare(self) -> None:
         if not self.main_text or not self.sample_text:
             return
-        self.last_score = self.app.compare_with_sample(self.main_text, self.sample_text)
+        self.last_result = self.app.compare_with_sample(self.main_text, self.sample_text)
+        scores = self.last_result.get("scores", {})
+        exact = self.last_result.get("exact_fragments", [])
+        paraphrases = self.last_result.get("paraphrase_candidates", [])
+        translit = self.last_result.get("transliteration", {}).get("shared_patterns", [])
+
         self.out.delete("1.0", "end")
-        self.out.insert("1.0", f"Сходство char n-gram профилей (cosine): {self.last_score:.4f}\n")
-        self.out.insert("end", "Интерпретация: это показатель сходства профилей, а не автоматический вывод об авторстве.")
+        self.out.insert("1.0", "Автоматизированный автороведческий анализ\n")
+        self.out.insert("end", "=" * 72 + "\n")
+        self.out.insert("end", json.dumps(scores, ensure_ascii=False, indent=2) + "\n\n")
+
+        self.out.insert("end", "Идентичные фрагменты и речевые обороты:\n")
+        if exact:
+            for item in exact[:12]:
+                self.out.insert("end", f" • [{item['matches']}x, {item['words']} слов] {item['fragment']}\n")
+        else:
+            self.out.insert("end", " • Совпадающих фрагментов достаточной длины не найдено.\n")
+
+        self.out.insert("end", "\nКандидаты на синонимию/перефраз:\n")
+        if paraphrases:
+            for item in paraphrases[:8]:
+                self.out.insert(
+                    "end",
+                    f" • sim={item['semantic_similarity']}, overlap={item['lexical_overlap']}\n"
+                    f"   A: {item['source']}\n"
+                    f"   B: {item['target']}\n",
+                )
+        else:
+            self.out.insert("end", " • Явные кандидаты не обнаружены.\n")
+
+        self.out.insert("end", "\nТранслитерация/смешанная графика:\n")
+        if translit:
+            self.out.insert("end", " • Совпавшие паттерны: " + ", ".join(translit[:10]) + "\n")
+        else:
+            self.out.insert("end", " • Совпадающие паттерны не выявлены.\n")
+
+        self.out.insert("end", "\nЧерновик вывода эксперта:\n")
+        for line in self.last_result.get("conclusion_draft", []):
+            self.out.insert("end", f" • {line}\n")
 
     def get_comparison_summary(self) -> dict:
-        return {"cosine_char_ngrams": round(self.last_score, 4)}
+        if not self.last_result:
+            return {}
+        return {
+            "scores": self.last_result.get("scores", {}),
+            "conclusion_draft": self.last_result.get("conclusion_draft", []),
+            "exact_fragments_count": len(self.last_result.get("exact_fragments", [])),
+            "paraphrase_candidates_count": len(self.last_result.get("paraphrase_candidates", [])),
+            "transliteration_shared": self.last_result.get("transliteration", {}).get("shared_patterns", []),
+        }

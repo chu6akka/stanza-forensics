@@ -6,7 +6,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
 
-from app.core.authorship.similarity import compare_char_ngrams
+from app.core.authorship.advanced_analysis import compare_texts_detailed
 from app.core.backends.natasha_backend import NatashaBackend
 from app.core.backends.pymorphy_backend import PymorphyBackend
 from app.core.context.hints import contextual_hints
@@ -160,8 +160,8 @@ class MainWindow(tk.Tk):
         }
         build_docx_report(report_data, target_dir / "report.docx")
 
-    def compare_with_sample(self, text_a: str, text_b: str) -> float:
-        return compare_char_ngrams(text_a, text_b)
+    def compare_with_sample(self, text_a: str, text_b: str) -> dict:
+        return compare_texts_detailed(text_a, text_b)
 
 
 def run_app() -> None:
